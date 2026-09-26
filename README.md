@@ -313,24 +313,6 @@ Exception        → log + "err"         # catch-all, non-fatal
 
 ---
 
-## `> cat obfuscation.md`
-
-```
-Internal symbols use Greek/Unicode identifiers to obscure logic:
-
-  _ζ   →  env-var fetcher lambda
-  _ψ   →  async forward functions prefix
-  _ξ   →  constants / frozensets prefix
-  _L   →  logger handle
-  _Sess → session dataclass (abbreviated)
-
-Variable names: lo, hi, cur, uid, dst, src, pm, fw
-All internal helpers are underscore-prefixed (private by convention).
-Progress bar uses Unicode block chars: ▓ ░
-```
-
----
-
 ## `> tree .`
 
 ```
