@@ -15,7 +15,7 @@
 
 # `[ TG-FORWARDER ]`
 
-**`// obfuscated · multi-user · production-grade · pyrogram`**
+**`// crypcoded · multi-user · production-grade · pyrogram`**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Pyrogram](https://img.shields.io/badge/Pyrogram-2.0.106-2CA5E0?style=flat-square&logo=telegram&logoColor=white)](https://pyrogram.org)
@@ -24,7 +24,7 @@
 
 ```
 ╔══════════════════════════════════════════════════════════╗
-║  coded by  devgagan  ·  github.com/devagganin            ║
+║  coded by  devgagan  ·  github.com/devgaganin            ║
 ╚══════════════════════════════════════════════════════════╝
 ```
 
@@ -35,7 +35,7 @@
 ## `> cat description.txt`
 
 ```
-A highly obfuscated, async, multi-user Telegram message forwarder
+A highly async, multi-user Telegram message forwarder
 built on Pyrogram. Copies entire message ranges — text, photo, video,
 document, audio, voice, sticker, animation, poll, contact, venue,
 location — from any public or accessible channel to any destination,
@@ -358,7 +358,7 @@ MIT License — use freely, credit appreciated.
 ╔═══════════════════════════════════════════════╗
 ║                                               ║
 ║   coded by  devgagan                          ║
-║   github.com/devagganin                       ║
+║   github.com/devgaganin                       ║
 ║                                               ║
 ║   // build fast. break nothing. stay anon.    ║
 ║                                               ║
