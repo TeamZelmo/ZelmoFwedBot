@@ -2,7 +2,7 @@ pyrogram==2.0.106
 tgcrypto
 cryptography
 aiohttp
-opencv-python
 pytesseract
 psutil
 python-dotenv
+opencv-python-headless==4.10.0.84
