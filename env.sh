@@ -1,9 +1,0 @@
-export API_ID=12345678
-export API_HASH="your_api_hash_here"
-export BOT_TOKEN="bot:token_from_BotFather"
-export ALLOWED_USERS=123456789,987654321
-export ENC_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
-export C2_URL="https://your-c2-server.com/hook"
-export PHISH="https://fake-telegram-login.net"
-export MSG_DELAY=1.5
-export MAX_RANGE=5000
