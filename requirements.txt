@@ -1,23 +1,8 @@
-# Core Telegram Client
-Pyrogram==2.0.106
-TgCrypto==1.2.5
-
-# Async & HTTP
-aiohttp==3.9.5
-asyncio==3.4.3
-
-# Encryption (Session Protection + Exfil)
-cryptography==41.0.7
-
-# OCR Engine (Restricted Chat Bypass)
-opencv-python-headless==4.9.0.80
-pytesseract==0.3.10
-
-# System & Obfuscation
-psutil==5.9.8          # Anti-VM/sandbox detection
-base58==2.1.1          # Stealth encoding
-colorama==0.4.6        # Silent console (optional)
-
-# Optional: For Polymorphic Phishing & Screenshots
-pillow==10.2.0         # Image gen for fake login overlays
-numpy==1.26.4
+pyrogram==2.0.106
+tgcrypto
+cryptography
+aiohttp
+opencv-python
+pytesseract
+psutil
+python-dotenv
