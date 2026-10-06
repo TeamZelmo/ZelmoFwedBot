@@ -1,25 +1,30 @@
 """
-Telegram Batch Forwarder - in-bot session-string login
+Telegram Batch Forwarder (Pyrogram)
 
-Har user bot me /login karke apna session string deta hai. Us user ka
-assistant account (user session) source se padhta hai aur destination me
-copy karta hai. Private channel ke liye wo account channel ka member hona chahiye.
+Login 2 tarah se:
+  1) Phone number -> OTP -> (2FA password)   [bot ke andar]
+  2) Session string
+
+Login ke baad user ka apna account (assistant) source se padhta hai aur
+destination me copy karta hai. Private channel ke liye wo account
+channel ka member hona chahiye.
 
 Env vars:
   API_ID, API_HASH, BOT_TOKEN   (required)
   ALLOWED_USERS  : comma separated user ids (khali = sab use kar sakte hain)
-  ENC_KEY        : Fernet key, session strings DB me encrypt hongi (recommended)
+  ENC_KEY        : Fernet key, sessions DB me encrypt hongi (recommended)
   DB_PATH        : default sessions.db
-  MSG_DELAY      : default 1.0  (groups me min 3.0)
+  MSG_DELAY      : default 1.0 (groups me min 3.0)
   MAX_RETRY      : default 3
   MAX_RANGE      : default 5000
   MAX_ACTIVE     : default 3
-
-Session string banane ke liye (terminal me):
-  python forwarder.py gen
+  LOGIN_TTL      : login steps ka timeout seconds, default 300
 
 ENC_KEY banane ke liye:
   python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"
+
+Terminal se session string banani ho to:
+  python forwarder.py gen
 """
 import os
 import re
@@ -31,9 +36,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, Tuple, Union
 
-from pyrogram import Client, filters, enums, errors as E
+from pyrogram import Client, filters, enums, idle, errors as E
 from pyrogram.errors import FloodWait, MessageIdInvalid, RPCError
-from pyrogram.types import Message
+from pyrogram.types import (
+    BotCommand, CallbackQuery, InlineKeyboardButton,
+    InlineKeyboardMarkup, Message,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +64,7 @@ GROUP_MIN_DELAY = 3.0
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "3"))
 MAX_RANGE = int(os.environ.get("MAX_RANGE", "5000"))
 MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE", "3"))
+LOGIN_TTL = int(os.environ.get("LOGIN_TTL", "300"))
 CHUNK = 100
 
 ChatRef = Union[int, str]
@@ -65,20 +74,18 @@ def _names(*names):
     return tuple(getattr(E, n) for n in names if hasattr(E, n))
 
 
-# in errors pe poora batch rok do
 FATAL = _names(
     "ChannelPrivate", "ChatAdminRequired", "UserNotParticipant",
     "ChatForwardsRestricted", "ChatWriteForbidden", "ChannelInvalid",
     "PeerIdInvalid", "UserBannedInChannel",
 )
-# in errors ka matlab session dead hai
 AUTH_DEAD = _names(
     "AuthKeyUnregistered", "AuthKeyInvalid", "SessionRevoked",
     "SessionExpired", "UserDeactivated", "UserDeactivatedBan",
 )
 
 
-# ── gen mode (session string banao) ──────────────────────────────────
+# ── gen mode ─────────────────────────────────────────────────────────
 def _gen_session() -> None:
     async def _run():
         async with Client("gen", api_id=API_ID, api_hash=API_HASH, in_memory=True) as c:
@@ -93,13 +100,13 @@ if len(sys.argv) > 1 and sys.argv[1] == "gen":
     sys.exit(0)
 
 
-# ── session storage (sqlite, optional encryption) ────────────────────
+# ── session storage ──────────────────────────────────────────────────
 _fernet = None
 if ENC_KEY:
     from cryptography.fernet import Fernet
     _fernet = Fernet(ENC_KEY.encode())
 else:
-    log.warning("ENC_KEY set nahi hai: session strings DB me plain text me save hongi.")
+    log.warning("ENC_KEY set nahi hai: sessions DB me plain text me save hongi.")
 
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute("CREATE TABLE IF NOT EXISTS sessions (uid INTEGER PRIMARY KEY, data TEXT NOT NULL)")
@@ -141,9 +148,16 @@ bot = Client(
     parse_mode=enums.ParseMode.MARKDOWN,
 )
 
-clients: Dict[int, Client] = {}      # uid -> running user client
+clients: Dict[int, Client] = {}
 _cl_lock = asyncio.Lock()
-awaiting: Set[int] = set()           # users jo abhi string bhejne wale hain
+tasks: Set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    tasks.add(t)
+    t.add_done_callback(tasks.discard)
+    return t
 
 
 async def _start_user_client(uid: int, string: str) -> Client:
@@ -160,7 +174,6 @@ async def _start_user_client(uid: int, string: str) -> Client:
 
 
 async def _warm_cache(c: Client) -> None:
-    """Dialogs load karo taaki private channel / dst ids resolve ho sakein."""
     try:
         async for _ in c.get_dialogs():
             pass
@@ -190,7 +203,57 @@ async def get_client(uid: int) -> Optional[Client]:
         return c
 
 
-# ── batch session state ──────────────────────────────────────────────
+# ── login state ──────────────────────────────────────────────────────
+@dataclass
+class LoginState:
+    step: str                      # phone | code | password | string
+    client: Optional[Client] = None
+    phone: str = ""
+    code_hash: str = ""
+    tries: int = 0
+    ts: float = field(default_factory=time.time)
+
+
+logins: Dict[int, LoginState] = {}
+
+
+async def _disconnect(c: Optional[Client]) -> None:
+    if c is not None and c.is_connected:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+
+
+async def drop_login(uid: int) -> None:
+    st = logins.pop(uid, None)
+    if st:
+        await _disconnect(st.client)
+
+
+async def _login_watch(uid: int, st: LoginState) -> None:
+    while logins.get(uid) is st:
+        await asyncio.sleep(15)
+        if logins.get(uid) is st and time.time() - st.ts > LOGIN_TTL:
+            await drop_login(uid)
+            try:
+                await bot.send_message(
+                    uid, "⌛ Login session expire ho gaya. /login se dubara shuru karo."
+                )
+            except Exception:
+                pass
+            return
+
+
+async def begin_login(uid: int, step: str) -> LoginState:
+    await drop_login(uid)
+    st = LoginState(step=step)
+    logins[uid] = st
+    spawn(_login_watch(uid, st))
+    return st
+
+
+# ── batch state ──────────────────────────────────────────────────────
 @dataclass
 class Sess:
     uid: int
@@ -234,7 +297,109 @@ class Sess:
 
 
 sessions: Dict[int, Sess] = {}
-tasks: Set[asyncio.Task] = set()
+
+
+# ── texts & keyboards ────────────────────────────────────────────────
+def start_text(name: str) -> str:
+    return (
+        f"👋 **Namaste {name}!**\n\n"
+        "Ye bot kisi bhi channel/group ke messages ka range tumhare "
+        "doosre chat me copy kar deta hai: text, photo, video, files, "
+        "voice, albums, sab.\n\n"
+        "**3 simple steps:**\n"
+        "1️⃣ /login: apne Telegram account se login\n"
+        "2️⃣ Source me join ho aur destination me post karne ki permission rakho\n"
+        "3️⃣ `/batch <link_range> <dest>` bhejo\n\n"
+        "Poori guide ke liye /help dabao."
+    )
+
+
+HELP_TEXT = (
+    "📖 **Help: kaise use karein**\n\n"
+    "**Step 1: Login**\n"
+    "/login → 📱 Phone Number choose karo\n"
+    "• Number country code ke saath bhejo: `+919876543210`\n"
+    "• Telegram app ki official **Telegram** chat me code aayega\n"
+    "• Code **space ke saath** bhejo: `1 2 3 4 5`\n"
+    "  (seedha `12345` bhejoge to Telegram use block kar deta hai)\n"
+    "• 2-step password ho to wo bhejo\n"
+    "Ya 🔑 Session String se bhi login kar sakte ho.\n\n"
+    "**Step 2: Access**\n"
+    "• Source channel/group me tumhara account member ho "
+    "(private ho to pehle invite link se join karo)\n"
+    "• Destination me tumhare account ko post karne ki permission ho\n\n"
+    "**Step 3: Forward**\n"
+    "`/batch <link_range> <dest>`\n\n"
+    "**Link range formats**\n"
+    "• Public: `https://t.me/channel/100-200`\n"
+    "• Private: `https://t.me/c/1234567890/100-200`\n"
+    "(pehla number start message id, doosra end message id)\n\n"
+    "**Destination**\n"
+    "• Chat ID: `-1001234567890`\n"
+    "• Ya username: `@mychannel`\n"
+    "Private channel ki ID link se milti hai: `t.me/c/1234567890/5` "
+    "me ID = `-1001234567890`\n\n"
+    "**Examples**\n"
+    "`/batch https://t.me/c/1234567890/40756-40900 -1009876543210`\n"
+    "`/batch https://t.me/mychan/10-50 @mydestination`\n\n"
+    "**Commands**\n"
+    "/login: login karo\n"
+    "/logout: logout + session revoke\n"
+    "/me: logged-in account dekho\n"
+    "/batch: forwarding shuru\n"
+    "/status: progress dekho\n"
+    "/cancel: batch ya login roko\n\n"
+    "**Dhyan rakho**\n"
+    "• Max `{max_range}` messages ek batch me\n"
+    "• Speed Telegram limits ke hisaab se rakhi gayi hai (groups me dheema)\n"
+    "• 'Restrict Saving Content' wale chats copy nahi hote\n"
+    "• Albums poore group ke saath copy hote hain"
+).replace("{max_range}", str(MAX_RANGE))
+
+LOGIN_CHOOSE_TEXT = (
+    "🔐 **Login method chuno**\n\n"
+    "📱 **Phone Number**: bot hi OTP lega (sabse aasan)\n"
+    "🔑 **Session String**: agar tumhare paas pehle se string hai\n\n"
+    "__Login tumhare apne account se hota hai, sirf apna hi account use karo.__"
+)
+
+PHONE_PROMPT = (
+    "📱 **Phone number bhejo** (country code ke saath)\n\n"
+    "Example: `+919876543210`\n\n"
+    "⚠️ Jab tak tum bot pe bharosa karte ho tabhi login karo: ye tumhare account "
+    "tak access deta hai. Message turant delete kar diya jayega.\n\n"
+    "__Cancel: /cancel__"
+)
+
+STRING_PROMPT = (
+    "🔑 **Session string bhejo** (agla message)\n\n"
+    "⚠️ Ye string account ka full access hai. Message turant delete kar diya jayega.\n\n"
+    "__Cancel: /cancel__"
+)
+
+
+def kb_start() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Login", callback_data="menu_login"),
+         InlineKeyboardButton("📖 Help", callback_data="menu_help")],
+        [InlineKeyboardButton("👤 My Account", callback_data="menu_me")],
+    ])
+
+
+def kb_login() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 Phone Number se", callback_data="login_phone")],
+        [InlineKeyboardButton("🔑 Session String se", callback_data="login_string")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu_start")],
+    ])
+
+
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="login_cancel")]])
+
+
+def kb_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_start")]])
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -252,7 +417,7 @@ def fmt_progress(s: Sess) -> str:
         f"• Errors    : `{s.err}`\n"
         f"• Progress  : `{s.processed}/{s.total}`\n"
         f"• ETA       : `{s.eta}`\n\n"
-        f"_/cancel bhej ke rok sakte ho_"
+        f"__/cancel bhej ke rok sakte ho__"
     )
 
 
@@ -282,22 +447,21 @@ def parse_dst(raw: str) -> Optional[ChatRef]:
     return m.group(1) if m else None
 
 
-def _is_allowed(_, __, msg: Message) -> bool:
-    return bool(msg.from_user) and (not ALLOWED or msg.from_user.id in ALLOWED)
+def _is_allowed(_, __, update) -> bool:
+    return bool(update.from_user) and (not ALLOWED or update.from_user.id in ALLOWED)
 
 
-def _is_awaiting(_, __, msg: Message) -> bool:
+def _in_login(_, __, msg: Message) -> bool:
     return (
         bool(msg.from_user)
-        and msg.from_user.id in awaiting
+        and msg.from_user.id in logins
         and bool(msg.text)
         and not msg.text.startswith("/")
     )
 
 
 allowed_filter = filters.create(_is_allowed)
-awaiting_filter = filters.create(_is_awaiting)
-
+login_filter = filters.create(_in_login)
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_\-=]{200,}$")
 
 
@@ -308,6 +472,19 @@ async def edit_progress(s: Sess, text: Optional[str] = None) -> None:
         await s.pmsg.edit_text(text or fmt_progress(s))
     except Exception:
         pass
+
+
+async def account_text(uid: int) -> Tuple[str, bool]:
+    c = await get_client(uid)
+    if not c:
+        return "ℹ️ Tum abhi logged in nahi ho.\n\n/login se login karo.", False
+    try:
+        me = await c.get_me()
+    except Exception as e:
+        return f"❌ Account check fail (`{type(e).__name__}`). /login dubara karo.", False
+    uname = f" (@{me.username})" if me.username else ""
+    busy = "🟢 Batch chal raha hai" if uid in sessions else "⚪ Koi batch nahi chal raha"
+    return f"👤 **{me.first_name}**{uname}\n🆔 `{me.id}`\n{busy}", True
 
 
 # ── core copy logic ──────────────────────────────────────────────────
@@ -435,7 +612,7 @@ async def run_batch(s: Sess) -> None:
         head = "❌ Stopped" if s.note else ("✅ Completed" if s.alive else "🛑 Cancelled")
         summary = (
             f"{head}\n"
-            + (f"_{s.note}_\n" if s.note else "")
+            + (f"__{s.note}__\n" if s.note else "")
             + f"\n**Batch**: `{s.src}` → `{s.dst}`\n"
             f"**Range**: `{s.lo}` – `{s.hi}` ({s.total} msgs)\n\n"
             f"• Forwarded : `{s.done}`\n"
@@ -449,36 +626,24 @@ async def run_batch(s: Sess) -> None:
 
 
 # ── login flow ───────────────────────────────────────────────────────
-async def do_login(msg: Message, string: str) -> None:
-    uid = msg.from_user.id
-    awaiting.discard(uid)
-
-    # string wala message turant delete karo
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    string = string.strip()
-    if not _SESSION_RE.match(string):
-        return await bot.send_message(
-            msg.chat.id, "❌ Ye valid session string nahi lag rahi. /login se dubara try karo."
-        )
+async def complete_login(uid: int, chat_id: int, string: str) -> None:
+    """Session string se client start karo, validate karo, save karo."""
     if uid in sessions:
-        return await bot.send_message(
-            msg.chat.id, "⚠️ Batch chal raha hai. Pehle /cancel karo, phir login badlo."
-        )
+        await bot.send_message(chat_id, "⚠️ Batch chal raha hai. Pehle /cancel karo, phir login badlo.")
+        return
 
-    wait = await bot.send_message(msg.chat.id, "🔐 Login ho raha hai, chats load ho rahi hain…")
+    wait = await bot.send_message(chat_id, "🔐 Login final ho raha hai, chats load ho rahi hain…")
     try:
         c = await _start_user_client(uid, string)
         me = await c.get_me()
         await _warm_cache(c)
     except AUTH_DEAD:
-        return await wait.edit_text("❌ Ye session ab valid nahi hai. Nayi string banao.")
+        await wait.edit_text("❌ Ye session ab valid nahi hai. Dubara /login karo.")
+        return
     except Exception as e:
         log.error("Login failed uid=%s: %s", uid, e)
-        return await wait.edit_text(f"❌ Login fail: `{type(e).__name__}`")
+        await wait.edit_text(f"❌ Login fail: `{type(e).__name__}`")
+        return
 
     async with _cl_lock:
         old = clients.pop(uid, None)
@@ -490,85 +655,230 @@ async def do_login(msg: Message, string: str) -> None:
             pass
 
     db_save(uid, string)
-    name = me.first_name or "User"
     uname = f" (@{me.username})" if me.username else ""
     await wait.edit_text(
-        f"✅ Logged in as **{name}**{uname}\n\n"
-        "Ab `/batch` use kar sakte ho. Logout ke liye /logout."
+        f"✅ **Login ho gaya!**\n\n👤 {me.first_name}{uname}\n\n"
+        "Ab `/batch <link_range> <dest>` use kar sakte ho.\n"
+        "Guide: /help"
     )
 
 
-# ── bot handlers ─────────────────────────────────────────────────────
+async def _finish_phone_login(uid: int, chat_id: int, st: LoginState) -> None:
+    c = st.client
+    try:
+        string = await c.export_session_string()
+    except Exception as e:
+        await drop_login(uid)
+        await bot.send_message(chat_id, f"❌ Session export fail: `{type(e).__name__}`")
+        return
+    await _disconnect(c)
+    logins.pop(uid, None)
+    await complete_login(uid, chat_id, string)
+
+
+@bot.on_message(filters.private & login_filter)
+async def on_login_text(_, msg: Message):
+    uid, chat_id = msg.from_user.id, msg.chat.id
+    st = logins.get(uid)
+    if not st:
+        return
+    text = (msg.text or "").strip()
+    st.ts = time.time()
+
+    # sensitive message turant delete
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    async def say(t: str, **kw):
+        return await bot.send_message(chat_id, t, **kw)
+
+    # ── string ──
+    if st.step == "string":
+        await drop_login(uid)
+        if not _SESSION_RE.match(text):
+            return await say("❌ Ye valid session string nahi lag rahi. /login se dubara try karo.")
+        return await complete_login(uid, chat_id, text)
+
+    # ── phone ──
+    if st.step == "phone":
+        phone = re.sub(r"[\s\-()]", "", text)
+        if not re.fullmatch(r"\+?\d{8,15}", phone):
+            return await say(
+                "❌ Number sahi nahi hai. Country code ke saath bhejo, jaise `+919876543210`",
+                reply_markup=kb_cancel(),
+            )
+        if not phone.startswith("+"):
+            phone = "+" + phone
+
+        note = await say("📨 Code bhej raha hoon…")
+        c = Client(
+            f"login_{uid}", api_id=API_ID, api_hash=API_HASH,
+            in_memory=True, no_updates=True,
+        )
+        try:
+            await c.connect()
+            sent = await c.send_code(phone)
+        except E.PhoneNumberInvalid:
+            await _disconnect(c)
+            return await note.edit_text("❌ Ye phone number invalid hai. Dubara bhejo.", reply_markup=kb_cancel())
+        except E.PhoneNumberBanned:
+            await _disconnect(c)
+            await drop_login(uid)
+            return await note.edit_text("🚫 Ye number Telegram pe banned hai.")
+        except FloodWait as fw:
+            await _disconnect(c)
+            await drop_login(uid)
+            return await note.edit_text(f"⏳ Telegram ne rok diya. {fw.value}s baad try karo.")
+        except Exception as e:
+            log.error("send_code failed uid=%s: %s", uid, e)
+            await _disconnect(c)
+            await drop_login(uid)
+            return await note.edit_text(f"❌ Code nahi bhej paya: `{type(e).__name__}`")
+
+        st.client, st.phone, st.code_hash, st.step = c, phone, sent.phone_code_hash, "code"
+        st.ts = time.time()
+        return await note.edit_text(
+            "✅ **Code bhej diya!**\n\n"
+            "Telegram app ki official **Telegram** chat (ya SMS) me code check karo.\n\n"
+            "Code **space ke saath** bhejo, jaise:\n`1 2 3 4 5`\n\n"
+            "⚠️ Seedha `12345` bhejoge to Telegram code block kar deta hai.",
+            reply_markup=kb_cancel(),
+        )
+
+    # ── code ──
+    if st.step == "code":
+        digits = re.sub(r"\D", "", text)
+        if not 4 <= len(digits) <= 7:
+            return await say("❌ Code sahi nahi lag raha. Jaise `1 2 3 4 5` bhejo.", reply_markup=kb_cancel())
+        try:
+            res = await st.client.sign_in(st.phone, st.code_hash, digits)
+        except E.SessionPasswordNeeded:
+            st.step = "password"
+            st.tries = 0
+            return await say(
+                "🔒 **2-step verification password** bhejo.\n__Message turant delete ho jayega.__",
+                reply_markup=kb_cancel(),
+            )
+        except E.PhoneCodeInvalid:
+            st.tries += 1
+            if st.tries >= 3:
+                await drop_login(uid)
+                return await say("❌ 3 baar galat code. /login se dubara shuru karo.")
+            return await say(
+                f"❌ Galat code ({st.tries}/3). Dubara bhejo (`1 2 3 4 5` format me).",
+                reply_markup=kb_cancel(),
+            )
+        except E.PhoneCodeExpired:
+            await drop_login(uid)
+            return await say("⌛ Code expire ho gaya. /login se naya code mangwao.")
+        except FloodWait as fw:
+            await drop_login(uid)
+            return await say(f"⏳ Telegram ne rok diya. {fw.value}s baad try karo.")
+        except Exception as e:
+            log.error("sign_in failed uid=%s: %s", uid, e)
+            await drop_login(uid)
+            return await say(f"❌ Login fail: `{type(e).__name__}`")
+
+        if res is False or not hasattr(res, "id"):
+            await drop_login(uid)
+            return await say(
+                "❌ Is number ka Telegram account nahi mila ya terms accept nahi hue. "
+                "Pehle Telegram app me account bana lo."
+            )
+        return await _finish_phone_login(uid, chat_id, st)
+
+    # ── 2FA password ──
+    if st.step == "password":
+        try:
+            await st.client.check_password(text)
+        except E.PasswordHashInvalid:
+            st.tries += 1
+            if st.tries >= 3:
+                await drop_login(uid)
+                return await say("❌ 3 baar galat password. /login se dubara shuru karo.")
+            return await say(f"❌ Galat password ({st.tries}/3). Dubara bhejo.", reply_markup=kb_cancel())
+        except FloodWait as fw:
+            await drop_login(uid)
+            return await say(f"⏳ Telegram ne rok diya. {fw.value}s baad try karo.")
+        except Exception as e:
+            log.error("check_password failed uid=%s: %s", uid, e)
+            await drop_login(uid)
+            return await say(f"❌ Login fail: `{type(e).__name__}`")
+        return await _finish_phone_login(uid, chat_id, st)
+
+
+# ── commands ─────────────────────────────────────────────────────────
 @bot.on_message(filters.command("start") & filters.private & allowed_filter)
 async def cmd_start(_, msg: Message):
-    await msg.reply(
-        "👋 **Message Forwarder**\n\n"
-        "1️⃣ `/login` — apna session string do\n"
-        "2️⃣ `/batch <link_range> <dest>` — forwarding shuru\n\n"
-        "Other: `/status`, `/cancel`, `/me`, `/logout`\n\n"
-        "**Examples:**\n"
-        "`/batch https://t.me/chan/100-200 -1001234567890`\n"
-        "`/batch https://t.me/c/123456/100-200 @mychannel`\n\n"
-        "_Private channel ke liye tumhara account us channel me joined hona chahiye._"
-    )
+    await msg.reply(start_text(msg.from_user.first_name or "dost"), reply_markup=kb_start())
+
+
+@bot.on_message(filters.command("help") & filters.private & allowed_filter)
+async def cmd_help(_, msg: Message):
+    await msg.reply(HELP_TEXT)
 
 
 @bot.on_message(filters.command("login") & filters.private & allowed_filter)
 async def cmd_login(_, msg: Message):
     uid = msg.from_user.id
     args = (msg.text or "").split(maxsplit=1)
-    if len(args) == 2:
-        return await do_login(msg, args[1])
-    awaiting.add(uid)
-    await msg.reply(
-        "🔑 Ab apna **session string** bhejo (agla message).\n\n"
-        "⚠️ Ye string tumhare account ka full access hai. Sirf wahi bot use karo jise "
-        "tum trust karte ho. Main message turant delete kar dunga.\n\n"
-        "_Cancel karne ke liye /cancel_"
-    )
-
-
-@bot.on_message(filters.private & awaiting_filter)
-async def on_string(_, msg: Message):
-    await do_login(msg, msg.text)
+    if len(args) == 2:  # /login <session_string>
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        string = args[1].strip()
+        if not _SESSION_RE.match(string):
+            return await bot.send_message(msg.chat.id, "❌ Ye valid session string nahi lag rahi.")
+        return await complete_login(uid, msg.chat.id, string)
+    await msg.reply(LOGIN_CHOOSE_TEXT, reply_markup=kb_login())
 
 
 @bot.on_message(filters.command("logout") & filters.private & allowed_filter)
 async def cmd_logout(_, msg: Message):
     uid = msg.from_user.id
-    awaiting.discard(uid)
+    await drop_login(uid)
     s = sessions.get(uid)
     if s:
         s.alive = False
     async with _cl_lock:
         c = clients.pop(uid, None)
+    had = db_load(uid) is not None
+    if c is None and had:
+        raw = db_load(uid)
+        try:
+            c = await _start_user_client(uid, raw)
+        except Exception:
+            c = None
+    revoked = False
     if c is not None:
         try:
-            await c.stop()
-        except Exception:
-            pass
-    had = db_load(uid) is not None
+            await c.log_out()      # Telegram side se session terminate
+            revoked = True
+        except Exception as e:
+            log.warning("log_out failed uid=%s: %s", uid, e)
+            try:
+                await c.stop()
+            except Exception:
+                pass
     db_del(uid)
     if not (had or c):
         return await msg.reply("ℹ️ Tum logged in nahi ho.")
     await msg.reply(
-        "✅ Logout ho gaya, string bot se hata di gayi.\n\n"
-        "Pura revoke karne ke liye Telegram → Settings → Devices me ja ke "
-        "us session ko terminate bhi kar do."
+        "✅ **Logout ho gaya.**\n"
+        + ("Session Telegram se bhi terminate kar diya gaya.\n" if revoked else
+           "Session bot se hata diya. Pura revoke karne ke liye Telegram → Settings → Devices "
+           "me session terminate karo.\n")
+        + "\nDubara login ke liye /login."
     )
 
 
 @bot.on_message(filters.command("me") & filters.private & allowed_filter)
 async def cmd_me(_, msg: Message):
-    c = await get_client(msg.from_user.id)
-    if not c:
-        return await msg.reply("ℹ️ Logged in nahi ho. /login karo.")
-    try:
-        me = await c.get_me()
-    except Exception as e:
-        return await msg.reply(f"❌ `{type(e).__name__}` - /login dubara karo.")
-    uname = f" (@{me.username})" if me.username else ""
-    await msg.reply(f"👤 Logged in as **{me.first_name}**{uname}")
+    text, _ok = await account_text(msg.from_user.id)
+    await msg.reply(text)
 
 
 @bot.on_message(filters.command("batch") & filters.private & allowed_filter)
@@ -577,68 +887,129 @@ async def cmd_batch(_, msg: Message):
     args = (msg.text or "").split(maxsplit=2)
     if len(args) < 3:
         return await msg.reply(
-            "❌ Usage: `/batch <link_range> <dest>`\n"
-            "Example: `/batch https://t.me/mychan/40756-40900 -1001234567890`"
+            "📦 **Batch usage**\n\n"
+            "`/batch <link_range> <dest>`\n\n"
+            "**Examples**\n"
+            "`/batch https://t.me/mychan/100-200 -1001234567890`\n"
+            "`/batch https://t.me/c/1234567890/100-200 @mychannel`\n\n"
+            "Detail: /help"
         )
 
     parsed = parse_range(args[1])
     if not parsed:
         return await msg.reply(
-            "❌ Invalid range.\nFormat: `https://t.me/<chan>/<start>-<end>` "
-            "ya `https://t.me/c/<id>/<start>-<end>`"
+            "❌ **Range sahi nahi hai.**\n\n"
+            "Format:\n`https://t.me/<channel>/<start>-<end>`\n"
+            "`https://t.me/c/<id>/<start>-<end>`"
         )
     src, lo, hi = parsed
 
     dst = parse_dst(args[2])
     if dst is None:
-        return await msg.reply("❌ Invalid destination (chat id ya @username do).")
+        return await msg.reply("❌ Destination sahi nahi hai. Chat ID (`-100…`) ya `@username` do.")
 
     if hi - lo + 1 > MAX_RANGE:
-        return await msg.reply(f"❌ Range bahut bada hai. Max `{MAX_RANGE}` messages.")
+        return await msg.reply(f"❌ Range bahut bada hai. Ek batch me max `{MAX_RANGE}` messages.")
 
     if uid in sessions:
-        return await msg.reply("⚠️ Pehle se batch chal raha hai. /cancel karo.")
+        return await msg.reply("⚠️ Pehle se batch chal raha hai. /status dekho ya /cancel karo.")
     if len(sessions) >= MAX_ACTIVE:
-        return await msg.reply("⏳ Abhi server busy hai, thodi der baad try karo.")
+        return await msg.reply("⏳ Abhi bot busy hai, thodi der baad try karo.")
 
     client = await get_client(uid)
     if client is None:
-        return await msg.reply("🔑 Pehle /login karke session string do.")
+        return await msg.reply("🔑 Pehle /login karke apna account connect karo.")
 
     s = Sess(uid=uid, src=src, dst=dst, lo=lo, hi=hi, client=client, cur=lo - 1)
     sessions[uid] = s
     s.pmsg = await msg.reply(fmt_progress(s))
-
-    t = asyncio.create_task(run_batch(s))
-    tasks.add(t)
-    t.add_done_callback(tasks.discard)
+    spawn(run_batch(s))
     log.info("Batch start uid=%s src=%s %d-%d dst=%s", uid, src, lo, hi, dst)
 
 
 @bot.on_message(filters.command("cancel") & filters.private & allowed_filter)
 async def cmd_cancel(_, msg: Message):
     uid = msg.from_user.id
-    if uid in awaiting:
-        awaiting.discard(uid)
+    if uid in logins:
+        await drop_login(uid)
         return await msg.reply("🛑 Login cancel kar diya.")
     s = sessions.get(uid)
     if not s or not s.alive:
-        return await msg.reply("ℹ️ Koi active batch nahi hai.")
+        return await msg.reply("ℹ️ Koi active batch ya login nahi hai.")
     s.alive = False
-    await msg.reply("🛑 Cancel request mili — current message ke baad ruk jayega.")
+    await msg.reply("🛑 Cancel request mili. Current message ke baad ruk jayega.")
 
 
 @bot.on_message(filters.command("status") & filters.private & allowed_filter)
 async def cmd_status(_, msg: Message):
     s = sessions.get(msg.from_user.id)
     if not s:
-        return await msg.reply("ℹ️ Koi active batch nahi hai.")
+        return await msg.reply("ℹ️ Koi active batch nahi hai.\n\nNaya batch: /batch")
     await msg.reply(fmt_progress(s))
 
 
+# ── inline buttons ───────────────────────────────────────────────────
+@bot.on_callback_query(allowed_filter)
+async def on_callback(_, cb: CallbackQuery):
+    uid = cb.from_user.id
+    data = cb.data or ""
+    msg = cb.message
+
+    async def show(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+        try:
+            await msg.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
+
+    if data == "menu_start":
+        await show(start_text(cb.from_user.first_name or "dost"), kb_start())
+    elif data == "menu_help":
+        await show(HELP_TEXT, kb_back())
+    elif data == "menu_login":
+        await show(LOGIN_CHOOSE_TEXT, kb_login())
+    elif data == "menu_me":
+        text, _ok = await account_text(uid)
+        await show(text, kb_back())
+    elif data == "login_phone":
+        if uid in sessions:
+            return await cb.answer("Batch chal raha hai, pehle /cancel karo.", show_alert=True)
+        await begin_login(uid, "phone")
+        await show(PHONE_PROMPT, kb_cancel())
+    elif data == "login_string":
+        if uid in sessions:
+            return await cb.answer("Batch chal raha hai, pehle /cancel karo.", show_alert=True)
+        await begin_login(uid, "string")
+        await show(STRING_PROMPT, kb_cancel())
+    elif data == "login_cancel":
+        await drop_login(uid)
+        await show("🛑 Login cancel kar diya.\n\nDubara: /login", kb_back())
+    await cb.answer()
+
+
 # ── entry point ──────────────────────────────────────────────────────
+async def main() -> None:
+    await bot.start()
+    try:
+        await bot.set_bot_commands([
+            BotCommand("start", "Bot shuru karo"),
+            BotCommand("help", "Poori guide"),
+            BotCommand("login", "Account login (phone / string)"),
+            BotCommand("batch", "Messages forward karo"),
+            BotCommand("status", "Batch progress"),
+            BotCommand("cancel", "Batch ya login roko"),
+            BotCommand("me", "Logged-in account"),
+            BotCommand("logout", "Logout + session revoke"),
+        ])
+    except Exception as e:
+        log.warning("set_bot_commands failed: %s", e)
+    me = await bot.get_me()
+    log.info("Bot ready: @%s", me.username)
+    await idle()
+    await bot.stop()
+
+
 if __name__ == "__main__":
     if not (API_ID and API_HASH and BOT_TOKEN):
         sys.exit("API_ID, API_HASH, BOT_TOKEN set karo.")
     log.info("Starting forwarder bot…")
-    bot.run()
+    bot.run(main())
