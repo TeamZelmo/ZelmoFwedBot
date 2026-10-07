@@ -13,7 +13,7 @@
    ╚═╝    ╚═════╝       ╚═╝      ╚══╝╚══╝ ╚═════╝ 
 ```
 
-# ⚡ TG-FORWARDER PRO
+# ⚡ZelmoFwed
 ### *Production-Ready, High-Concurrency Telegram Batch Migration Bot*
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
@@ -123,14 +123,14 @@ nano .env
 
 # 6. Background screen me bot run karein
 screen -S forwarder
-python forwarder_bot.py
+python ZelmoFwed.py
 # Detach karne ke liye: Press Ctrl+A then D
 ```
 
 #### Systemd Background Service (Production Best Practice)
 
 ```bash
-sudo nano /etc/systemd/system/tgforwarder.service
+sudo nano /etc/systemd/system/ZelmoFwed.service
 ```
 
 Paste configuration:
@@ -143,7 +143,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/tg-forwarder
-ExecStart=/root/tg-forwarder/venv/bin/python forwarder_bot.py
+ExecStart=/root/tg-forwarder/venv/bin/python ZelmoFwed.py
 Restart=always
 RestartSec=5
 EnvironmentFile=/root/tg-forwarder/.env
@@ -155,7 +155,7 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now tgforwarder
-sudo systemctl status tgforwarder
+sudo systemctl status ZelmoFwed
 ```
 
 ---
@@ -233,8 +233,8 @@ docker compose logs -f
 ## 📁 Repository Tree
 
 ```text
-tg-forwarder/
-├── forwarder_bot.py       # Core bot logic & Pyrogram routing
+ZelmoFwedBot/
+├── ZelmoFwed.py       # Core bot logic & Pyrogram routing
 ├── requirements.txt       # Dependencies (Pyrogram, TgCrypto, python-dotenv)
 ├── Dockerfile             # Container definition file
 ├── docker-compose.yml     # Multi-container orchestration config
