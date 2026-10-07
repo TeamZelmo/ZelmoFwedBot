@@ -3,5 +3,5 @@ services:
     name: telegram-fwd-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python forwarder_bot.py
+    startCommand: python ZelmoFwed.py
     region: singapore
