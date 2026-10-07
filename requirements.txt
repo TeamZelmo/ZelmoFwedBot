@@ -5,3 +5,5 @@ aiohttp
 opencv-python-headless
 pytesseract
 psutil
+python-dotenv
+uvloop ; sys_platform != "win32"
