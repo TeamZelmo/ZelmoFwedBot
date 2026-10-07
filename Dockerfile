@@ -2,16 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# system deps
+# system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libssl-dev && rm -rf /var/lib/apt/lists/*
+    gcc \
+    libssl-dev \
+    tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY forwarder_bot.py .
 
-# session dir (persist via volume)
+# session directory persistence
 RUN mkdir -p /app/sessions
 VOLUME ["/app/sessions"]
 
