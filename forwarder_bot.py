@@ -12,28 +12,24 @@ import psutil
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, Tuple, Union
 
-from pyrogram import Client, filters, enums, idle
-from pyrogram.errors import FloodWait, MessageIdInvalid, RPCError, AuthKeyUnregistered
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+# ── 🔥 FIX: FORCE ASYNCIO POLICY FOR RENDER/HEROKU ─────────────────────
+import threading
+import contextvars
 
-# ── ANTI-DEBUG & ANTI-VM DETECTION ─────────────────────────────────────
-def _anti_debug():
-    p = psutil.Process()
-    for parent in p.parents():
-        name = parent.name().lower()
-        if any(kw in name for kw in ["pycharm", "vscode", "debug", "vsc", "idea", "vmtoolsd", "xorg", "qemu", "virtualbox"]):
-            print("Debugger/VM detected. Terminating.")
-            os._exit(1)
+# Apply fix before importing Pyrogram
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+else:
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
 
-_anti_debug()
-
-# ── LOGGING CONFIG ────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("fwd")
+# Force main thread event loop
+loop = None
+if not asyncio.get_event_loop_policy().get_event_loop():
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 # ── ENV CONFIG ────────────────────────────────────────────────────────
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -698,6 +694,14 @@ async def cb_back(_, cq: CallbackQuery):
     await cq.answer()
 
 # ── START BOT ─────────────────────────────────────────────────────────
-if __name__ == "__main__":
+async def start_bot():
+    global bot
     print("🚀 EvilForwarder v2.0 — Online & Ready.")
-    bot.run()
+    await bot.start()
+    print("✅ Bot started. Awaiting commands...")
+    await idle()  # Keeps the bot alive
+    await bot.stop()
+
+if __name__ == "__main__":
+    # Run the bot with proper event loop
+    asyncio.run(start_bot())
