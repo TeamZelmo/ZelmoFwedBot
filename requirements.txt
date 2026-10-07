@@ -1,9 +1,9 @@
 pyrogram==2.0.106
-TgCrypto
+tgcrypto
 cryptography
 aiohttp
 opencv-python-headless
 pytesseract
 psutil
 python-dotenv
-uvloop ; sys_platform != "win32"
+uvloop; sys_platform != "win32"
